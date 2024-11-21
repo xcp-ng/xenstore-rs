@@ -24,7 +24,7 @@ optional = true
 
 [dependencies.futures]
 version = "0.3.31"
-default-features = false
+features = ["write-all-vectored"]
 optional = true
 
 # Tokio implementation dependencies
@@ -58,4 +58,5 @@ colog = "1.3.0"
 default = ["unix"]
 unix = []
 async = ["futures", "trait-variant"]
+async-generic = ["log", "async", "anyhow", "uuid"]
 async-tokio = ["log", "async", "tokio", "anyhow", "uuid", "libc"]
