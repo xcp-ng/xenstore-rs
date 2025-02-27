@@ -2,9 +2,8 @@ use std::{cell::Cell, collections::HashMap};
 
 use anyhow::{anyhow, bail};
 use futures::{
-    channel::{mpsc, oneshot},
+    channel::oneshot,
     io::{self, Error, ErrorKind},
-    SinkExt, StreamExt,
 };
 use log::{debug, info, warn};
 use uuid::Uuid;
@@ -26,7 +25,7 @@ pub enum XsAsyncMessage {
     Request(XsAsyncRequest),
     WatchSubscribe {
         path: Box<str>,
-        event_sender: mpsc::Sender<Box<str>>,
+        event_sender: flume::Sender<Box<str>>,
         result_channel: oneshot::Sender<io::Result<XsWatchToken>>,
     },
     WatchUnsubscribe(XsWatchToken),
@@ -43,7 +42,7 @@ enum XsAsyncTask {
 }
 
 struct WatchSubscriberInfo {
-    channel: mpsc::Sender<Box<str>>,
+    channel: flume::Sender<Box<str>>,
     // We need to store the watch patch as it is required by UNWATCH.
     path: Box<str>,
 }
@@ -70,7 +69,7 @@ impl XsAsyncState {
     async fn process_message(
         &mut self,
         message: XsAsyncMessage,
-        xs_sender: &mut mpsc::Sender<XsMessage>,
+        xs_sender: &flume::Sender<XsMessage>,
     ) -> anyhow::Result<()> {
         // Find a available task slot.
         let Some((req_id, slot)) = self
@@ -90,7 +89,7 @@ impl XsAsyncState {
             }) => {
                 request.request_id = req_id as u32;
 
-                xs_sender.send(request).await?;
+                xs_sender.send_async(request).await?;
                 *slot = Some(XsAsyncTask::Request(response_sender));
                 self.task_count += 1;
             }
@@ -103,14 +102,15 @@ impl XsAsyncState {
 
                 // Make the actual WATCH command
                 xs_sender
-                    .send(XsMessage::from_string_slice(
+                    .send_async(XsMessage::from_string_slice(
                         XsMessageType::Watch,
                         req_id as u32,
                         &[&path, &token.0.to_string()],
+                        true,
                     ))
                     .await?;
 
-                // Wait until we got confirmation of the WATCH command by upstream.
+                // Wait until we get confirmation of the WATCH command by upstream.
                 *slot = Some(XsAsyncTask::WatchSubscribe {
                     subscriber_info: WatchSubscriberInfo { channel, path },
                     result_channel,
@@ -126,10 +126,11 @@ impl XsAsyncState {
 
                 // Make the actual UNWATCH command
                 xs_sender
-                    .send(XsMessage::from_string_slice(
+                    .send_async(XsMessage::from_string_slice(
                         XsMessageType::Unwatch,
                         req_id as u32,
                         &[path, &token.0.to_string()],
+                        true,
                     ))
                     .await?;
 
@@ -225,7 +226,7 @@ impl XsAsyncState {
         let uuid = Uuid::try_parse(token).map_err(|_| anyhow!("Got non-UUID token"))?;
 
         if let Some(subscriber) = self.watch_subscribers.get_mut(&uuid) {
-            if let Err(e) = subscriber.channel.send(value.into()).await {
+            if let Err(e) = subscriber.channel.send_async(value.into()).await {
                 warn!("Lost watch subscriber: {e}");
 
                 // Subscriber is dead, remove it.
@@ -240,15 +241,15 @@ impl XsAsyncState {
 
     pub async fn run(
         mut self,
-        mut message_channel: mpsc::Receiver<XsAsyncMessage>,
-        mut xs_receiver: mpsc::Receiver<XsMessage>,
-        mut xs_sender: mpsc::Sender<XsMessage>,
+        message_channel: flume::Receiver<XsAsyncMessage>,
+        xs_receiver: flume::Receiver<XsMessage>,
+        xs_sender: flume::Sender<XsMessage>,
     ) {
         loop {
             if self.task_count == MAX_REQUEST_COUNT {
                 // We can't process another task, only interface responses.
                 debug!("Too much tasks");
-                let Some(response) = xs_receiver.next().await else {
+                let Ok(response) = xs_receiver.recv_async().await else {
                     break;
                 };
 
@@ -257,13 +258,15 @@ impl XsAsyncState {
                 }
             } else {
                 futures::select! {
-                    response = xs_receiver.select_next_some() => {
+                    response = xs_receiver.recv_async() => {
+                        let Ok(response) = response else { break };
                         if let Err(e) = self.process_response(response).await {
                             warn!("Process response failure: {e}")
                         }
                     },
-                    message = message_channel.select_next_some() => {
-                        if let Err(e) = self.process_message(message, &mut xs_sender).await {
+                    message = message_channel.recv_async() => {
+                        let Ok(message) = message else { break };
+                        if let Err(e) = self.process_message(message, &xs_sender).await {
                             warn!("Process message failure: {e}")
                         }
                     },

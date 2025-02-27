@@ -8,213 +8,89 @@
 //! will yield [None].
 
 mod device;
-mod interface;
-mod wire_async;
 
-use std::{
-    env,
-    io::{self, ErrorKind},
-    pin::Pin,
-    str::FromStr,
-    task::{Context, Poll},
-};
+use std::{env, io};
 
-use futures::Stream;
+use futures::task::Spawn;
+use log::{debug, error};
 use tokio::{
+    io::{AsyncRead, AsyncWrite},
     net::UnixStream,
-    sync::{mpsc, oneshot},
 };
+use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use interface::{launch_xenstore_task, XsTokioMessage, XsTokioRequest, XsWatchToken};
-
-use crate::{
-    wire::{XsMessage, XsMessageType},
-    AsyncWatch, AsyncXs, AsyncXsPerm, XsPermission,
-};
+use crate::{wire::XsMessage, xs_async::XsAsyncImpl};
 
 /// Tokio Xenstore implementation.
 ///
 /// It can be cloned and used concurrently by multiple tasks.
 #[derive(Clone, Debug)]
-pub struct XsTokio(mpsc::UnboundedSender<XsTokioMessage>);
+pub struct XsTokio;
+
+struct TokioSpawner;
+
+impl Spawn for TokioSpawner {
+    fn spawn_obj(
+        &self,
+        future: futures::task::FutureObj<'static, ()>,
+    ) -> Result<(), futures::task::SpawnError> {
+        tokio::task::spawn(future);
+        Ok(())
+    }
+}
 
 impl XsTokio {
     /// Try to open Xenstore interface.
     /// Attempt in order :
     ///  - `/run/xenstored/socket` (unix domain socket)
     ///  - [crate::wire::XENBUS_DEVICE_PATH] (xenstore device)
-    pub async fn new() -> io::Result<Self> {
+    pub async fn new() -> io::Result<XsAsyncImpl> {
         let xsd_path =
             env::var("XENSTORED_PATH").unwrap_or_else(|_| "/run/xenstored/socket".to_string());
 
         // Use xenstored socket first
         if let Ok(stream) = UnixStream::connect(xsd_path).await {
-            return Ok(Self(launch_xenstore_task(stream)));
+            return Ok(launch_xenstore_task(stream)?);
         }
 
-        Ok(Self(launch_xenstore_task(device::XsDevice::new().await?)))
+        Ok(launch_xenstore_task(device::XsDevice::new().await?)?)
     }
+}
 
-    async fn transmit_request(&self, request: XsMessage) -> io::Result<XsMessage> {
-        let (response_sender, response_receiver) = oneshot::channel();
-        let req_msg_type = request.msg_type;
+pub fn launch_xenstore_task<S>(xs_stream: S) -> io::Result<XsAsyncImpl>
+where
+    S: AsyncRead + AsyncWrite + Send + 'static,
+{
+    let (rx, tx) = tokio::io::split(xs_stream);
+    let (response_tx, xs_receiver) = flume::bounded(4);
+    let (xs_sender, request_rx) = flume::bounded(4);
 
-        self.0
-            .send(XsTokioMessage::Request(XsTokioRequest {
-                request,
-                response_sender,
-            }))
-            .map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e))?;
+    // Message receiver task
+    tokio::spawn(async move {
+        let mut rx = rx.compat();
+        while let Ok(message) = XsMessage::read_message_async(&mut rx).await {
+            debug!("< {message:?}");
 
-        let response = response_receiver
-            .await
-            .map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e))?;
-
-        match response.msg_type {
-            // Response type must match request.
-            msg_type if msg_type == req_msg_type => Ok(response),
-            XsMessageType::Error => Err(response.parse_error()),
-            msg_type => Err(io::Error::new(
-                ErrorKind::InvalidData,
-                format!("Got unrelated response ({msg_type:?})"),
-            )),
+            if response_tx.send_async(message).await.is_err() {
+                break;
+            }
         }
-    }
-}
 
-impl AsyncXs for XsTokio {
-    async fn directory(&self, path: &str) -> io::Result<Vec<Box<str>>> {
-        let response = self
-            .transmit_request(XsMessage::from_string(XsMessageType::Directory, 0, path))
-            .await?;
+        error!("Read message failure");
+    });
 
-        Ok(response
-            .parse_payload_list()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-            // convert &str to Box<str>
-            .iter()
-            .map(|s| s.to_string().into_boxed_str())
-            .collect())
-    }
+    // Message sender task
+    tokio::spawn(async move {
+        let mut tx = tx.compat_write();
+        while let Ok(message) = request_rx.recv_async().await {
+            debug!("> {message:?}");
 
-    async fn read(&self, path: &str) -> io::Result<Box<str>> {
-        let response = self
-            .transmit_request(XsMessage::from_string(XsMessageType::Read, 0, path))
-            .await?;
+            if let Err(e) = XsMessage::write_message_async(&message, &mut tx).await {
+                error!("Write message failure {e}");
+                break;
+            }
+        }
+    });
 
-        Ok(response
-            .parse_payload_str()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?
-            .unwrap_or_default()
-            // convert &str to Box<str>
-            .to_string()
-            .into_boxed_str())
-    }
-
-    async fn write(&self, path: &str, data: &str) -> io::Result<()> {
-        self.transmit_request(XsMessage::from_string_slice(
-            XsMessageType::Write,
-            0,
-            &[path, data],
-            false,
-        ))
-        .await?;
-
-        Ok(())
-    }
-
-    async fn rm(&self, path: &str) -> io::Result<()> {
-        self.transmit_request(XsMessage::from_string(XsMessageType::Rm, 0, path))
-            .await?;
-
-        Ok(())
-    }
-}
-
-impl AsyncXsPerm for XsTokio {
-    async fn get_perms(&self, path: &str) -> io::Result<Vec<XsPermission>> {
-        let response = self
-            .transmit_request(XsMessage::from_string(XsMessageType::GetPerms, 0, path))
-            .await?;
-
-        let payloads = response
-            .parse_payload_list()
-            .map_err(|e| io::Error::new(ErrorKind::InvalidData, e))?;
-
-        payloads
-            .iter()
-            .map(|s| XsPermission::from_str(s).map_err(io::Error::other))
-            .collect()
-    }
-
-    async fn set_perms(&self, path: &str, perms: &[XsPermission]) -> io::Result<()> {
-        // Build a parameter list for <path>|<perm-as-string>|+?
-        let perms_strings: Vec<String> = perms.iter().map(ToString::to_string).collect();
-
-        let mut perms_str: Vec<&str> = Vec::new();
-        perms_str.reserve_exact(1 + perms.len());
-
-        perms_str.push(path);
-        perms_strings.iter().for_each(|s| perms_str.push(s));
-
-        self.transmit_request(XsMessage::from_string_slice(
-            XsMessageType::SetPerms,
-            0,
-            &perms_str,
-            true,
-        ))
-        .await?;
-
-        Ok(())
-    }
-}
-
-/// Tokio watch object.
-pub struct XsTokioWatch {
-    event_receiver: mpsc::Receiver<Box<str>>,
-    tokio_channel: mpsc::UnboundedSender<XsTokioMessage>,
-    token: XsWatchToken,
-}
-
-impl Stream for XsTokioWatch {
-    type Item = Box<str>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        self.event_receiver.poll_recv(cx)
-    }
-}
-
-impl Drop for XsTokioWatch {
-    fn drop(&mut self) {
-        // Try to unsubscribe upstream (to not leak the watch token/state).
-        // If it fails, it means that the upper backend has died.
-        self.tokio_channel
-            .send(XsTokioMessage::WatchUnsubscribe(self.token))
-            .ok();
-    }
-}
-
-impl AsyncWatch for XsTokio {
-    async fn watch(&self, path: &str) -> io::Result<impl Stream<Item = Box<str>> + 'static> {
-        let (event_sender, event_receiver) = mpsc::channel(8);
-        let (result_channel, result_receiver) = oneshot::channel();
-
-        self.0
-            .send(XsTokioMessage::WatchSubscribe {
-                path: path.to_string().into_boxed_str(),
-                event_sender,
-                result_channel,
-            })
-            .map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e))?;
-
-        let token = result_receiver
-            .await
-            .map_err(|e| io::Error::new(ErrorKind::BrokenPipe, e))??;
-
-        Ok(XsTokioWatch {
-            event_receiver,
-            token,
-            tokio_channel: self.0.clone(),
-        })
-    }
+    XsAsyncImpl::new(TokioSpawner, xs_receiver, xs_sender)
 }
