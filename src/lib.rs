@@ -15,6 +15,9 @@ pub mod unix;
 #[cfg(feature = "async-tokio")]
 pub mod tokio;
 
+#[cfg(feature = "async-smol")]
+pub mod smol;
+
 #[cfg(feature = "async-generic")]
 pub mod xs_async;
 

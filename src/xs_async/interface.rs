@@ -271,7 +271,7 @@ impl XsAsyncState {
                         }
                     },
                     // In case we get a None, something is dead in the loop, stop here.
-                    default => break,
+                    complete => break,
                 }
             }
         }

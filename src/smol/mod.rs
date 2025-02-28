@@ -1,4 +1,4 @@
-//! Tokio async implementation.
+//! smol/async-std async implementation.
 //!
 //! Alike Unix implementation, uses either xenstored socket or xenbus/xenstore device.
 //!
@@ -7,17 +7,15 @@
 //! all future operations will fail with [io::ErrorKind::BrokenPipe] and all watchers
 //! will yield [None].
 
+// TODO: Use at some point Spawn trait.
+// See https://github.com/smol-rs/async-executor/issues/25
+
 mod device;
 
-use std::{env, io};
+use std::{env, io, marker::PhantomData};
 
-use futures::Stream;
+use futures::{AsyncRead, AsyncWrite, Stream};
 use log::{debug, error};
-use tokio::{
-    io::{AsyncRead, AsyncWrite},
-    net::UnixStream,
-};
-use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::{
     wire::XsMessage,
@@ -25,31 +23,41 @@ use crate::{
     AsyncWatch, AsyncXs, AsyncXsPerm, XsPermission,
 };
 
-/// Tokio Xenstore implementation.
+use async_executor::Executor;
+use async_net::unix::UnixStream;
+
+/// Smol Xenstore implementation.
 ///
 /// It can be cloned and used concurrently by multiple tasks.
 #[derive(Clone, Debug)]
-pub struct XsTokio(XsAsyncImpl);
+pub struct XsSmol<'a>(XsAsyncImpl, PhantomData<Executor<'a>>);
 
-impl XsTokio {
+impl<'a> XsSmol<'a> {
     /// Try to open Xenstore interface.
     /// Attempt in order :
     ///  - `/run/xenstored/socket` (unix domain socket)
     ///  - [crate::wire::XENBUS_DEVICE_PATH] (xenstore device)
-    pub async fn new() -> io::Result<Self> {
+    pub async fn new(executor: &Executor<'a>) -> io::Result<Self> {
         let xsd_path =
             env::var("XENSTORED_PATH").unwrap_or_else(|_| "/run/xenstored/socket".to_string());
 
         // Use xenstored socket first
         if let Ok(stream) = UnixStream::connect(xsd_path).await {
-            return Ok(Self(launch_xenstore_task(stream)?));
+            return Ok(Self(
+                run_xenstore_task(executor, stream.clone(), stream)?,
+                PhantomData,
+            ));
         }
 
-        Ok(Self(launch_xenstore_task(device::XsDevice::new().await?)?))
+        let device = device::XsDevice::new().await?;
+        Ok(Self(
+            run_xenstore_task(executor, device.clone(), device)?,
+            PhantomData,
+        ))
     }
 }
 
-impl AsyncXs for XsTokio {
+impl AsyncXs for XsSmol<'_> {
     async fn directory(&self, path: &str) -> io::Result<Vec<Box<str>>> {
         Ok(self.0.directory(path).await?)
     }
@@ -67,7 +75,7 @@ impl AsyncXs for XsTokio {
     }
 }
 
-impl AsyncWatch for XsTokio {
+impl AsyncWatch for XsSmol<'_> {
     async fn watch(
         &self,
         path: &str,
@@ -76,7 +84,7 @@ impl AsyncWatch for XsTokio {
     }
 }
 
-impl AsyncXsPerm for XsTokio {
+impl AsyncXsPerm for XsSmol<'_> {
     async fn get_perms(&self, path: &str) -> io::Result<Vec<XsPermission>> {
         Ok(self.0.get_perms(path).await?)
     }
@@ -86,12 +94,15 @@ impl AsyncXsPerm for XsTokio {
     }
 }
 
-pub fn launch_xenstore_task<S>(xs_stream: S) -> io::Result<XsAsyncImpl>
+pub fn run_xenstore_task<R, W>(
+    executor: &Executor<'_>,
+    mut xs_read: R,
+    mut xs_write: W,
+) -> io::Result<XsAsyncImpl>
 where
-    S: AsyncRead + AsyncWrite + Send + 'static,
+    R: AsyncRead + Send + Unpin + 'static,
+    W: AsyncWrite + Send + Unpin + 'static,
 {
-    let (rx, tx) = tokio::io::split(xs_stream);
-
     // Xenstore response channel
     let (response_tx, xs_receiver) = flume::bounded(4);
 
@@ -102,34 +113,38 @@ where
     let (xs_async_tx, xs_async_rx) = flume::unbounded();
 
     // Message receiver task
-    tokio::spawn(async move {
-        let mut rx = rx.compat();
-        while let Ok(message) = XsMessage::read_message_async(&mut rx).await {
-            debug!("< {message:?}");
+    executor
+        .spawn(async move {
+            while let Ok(message) = XsMessage::read_message_async(&mut xs_read).await {
+                debug!("< {message:?}");
 
-            if response_tx.send_async(message).await.is_err() {
-                break;
+                if response_tx.send_async(message).await.is_err() {
+                    break;
+                }
             }
-        }
 
-        error!("Read message failure");
-    });
+            error!("Read message failure");
+        })
+        .detach();
 
     // Message sender task
-    tokio::spawn(async move {
-        let mut tx = tx.compat_write();
-        while let Ok(message) = request_rx.recv_async().await {
-            debug!("> {message:?}");
+    executor
+        .spawn(async move {
+            while let Ok(message) = request_rx.recv_async().await {
+                debug!("> {message:?}");
 
-            if let Err(e) = XsMessage::write_message_async(&message, &mut tx).await {
-                error!("Write message failure {e}");
-                break;
+                if let Err(e) = XsMessage::write_message_async(&message, &mut xs_write).await {
+                    error!("Write message failure {e}");
+                    break;
+                }
             }
-        }
-    });
+        })
+        .detach();
 
     let state = XsAsyncState::default();
-    tokio::spawn(state.run(xs_async_rx, xs_receiver, xs_sender));
+    executor
+        .spawn(state.run(xs_async_rx, xs_receiver, xs_sender))
+        .detach();
 
     XsAsyncImpl::new(xs_async_tx)
 }

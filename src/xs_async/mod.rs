@@ -15,17 +15,18 @@ use core::{
 use futures::{
     channel::oneshot,
     io::{self, ErrorKind},
-    task::{Spawn, SpawnExt},
     FutureExt, Stream,
 };
 use std::str::FromStr;
 
-use interface::{XsAsyncMessage, XsAsyncRequest, XsAsyncState, XsWatchToken};
+use interface::{XsAsyncMessage, XsAsyncRequest, XsWatchToken};
 
 use crate::{
     wire::{XsMessage, XsMessageType},
     AsyncWatch, AsyncXs, AsyncXsPerm, XsPermission,
 };
+
+pub use interface::XsAsyncState;
 
 /// Generic async Xenstore implementation.
 ///
@@ -34,17 +35,7 @@ use crate::{
 pub struct XsAsyncImpl(flume::Sender<XsAsyncMessage>);
 
 impl XsAsyncImpl {
-    pub fn new(
-        spawner: impl Spawn,
-        xs_receiver: flume::Receiver<XsMessage>,
-        xs_sender: flume::Sender<XsMessage>,
-    ) -> io::Result<Self> {
-        let (tx, rx) = flume::bounded(4);
-
-        spawner
-            .spawn(XsAsyncState::default().run(rx, xs_receiver, xs_sender))
-            .map_err(io::Error::other)?;
-
+    pub fn new(tx: flume::Sender<XsAsyncMessage>) -> io::Result<Self> {
         Ok(Self(tx))
     }
 
