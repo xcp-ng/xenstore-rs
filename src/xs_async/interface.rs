@@ -233,7 +233,30 @@ impl XsAsyncState {
                 self.watch_subscribers.remove(&uuid);
             }
         } else {
-            warn!("Unregistered watch message ? ({uuid})");
+            // Some kernels may misorder the watch event and watch response, try to
+            // deal with these cases by preemptively sending the event to its related
+            // channel.
+            // We lookup in pending task if any task matches the watch_event, and
+            // send the event to its dedicated channel, so we won't lose the event.
+            if let Some(channel) = self
+                .pending_tasks
+                .iter_mut()
+                .map(Cell::get_mut)
+                .flatten()
+                .find_map(|task| match task {
+                    XsAsyncTask::WatchSubscribe {
+                        token,
+                        subscriber_info,
+                        ..
+                    } if token.0 == uuid => Some(subscriber_info.channel.clone()),
+                    _ => None,
+                })
+            {
+                debug!("Processing out of order watch response/event ({uuid})");
+                channel.send(value.into()).ok();
+            } else {
+                warn!("Unregistered watch message ? ({uuid})");
+            }
         }
 
         Ok(())
